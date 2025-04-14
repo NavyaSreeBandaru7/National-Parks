@@ -13,3 +13,6 @@ scikit-learn==1.3.2
 nltk==3.8.1
 tqdm==4.66.1
 lxml==4.9.3
+protobuf==3.20.3  # Required for transformers compatibility
+sentencepiece==0.1.99  # Required for tokenizers
+tokenizers==0.14.1  # Required for transformers
