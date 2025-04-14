@@ -1,5 +1,7 @@
 National Park Sentiment Analysis Dashboard
+
 Overview
+
 This Streamlit application analyzes visitor sentiments across U.S. National Parks to identify patterns in reviews, highlighting what visitors love and areas for improvement. The dashboard provides interactive visualizations and insights based on sentiment analysis of park reviews.
 Features
 
