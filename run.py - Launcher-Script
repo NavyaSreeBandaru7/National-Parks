@@ -1,0 +1,133 @@
+import os
+import subprocess
+import sys
+import time
+import webbrowser
+from pathlib import Path
+
+def check_dependencies():
+    """Check if all required packages are installed."""
+    try:
+        import streamlit
+        import pandas
+        import numpy
+        import matplotlib
+        import seaborn
+        import plotly
+        import wordcloud
+        import requests
+        import bs4
+        import transformers
+        import torch
+        import sklearn
+        import nltk
+        import tqdm
+        print("✅ All dependencies are installed.")
+        return True
+    except ImportError as e:
+        print(f"❌ Missing dependency: {e.name}")
+        print("Please install the required packages using: pip install -r requirements.txt")
+        return False
+
+def download_nltk_resources():
+    """Download required NLTK resources if not already present."""
+    try:
+        import nltk
+        resources = ['stopwords', 'punkt']
+        for resource in resources:
+            try:
+                # Check if resource already exists
+                nltk.data.find(f'corpora/{resource}')
+                print(f"✅ NLTK resource '{resource}' is already downloaded.")
+            except LookupError:
+                # Download if not found
+                print(f"📥 Downloading NLTK resource: {resource}")
+                nltk.download(resource, quiet=True)
+                print(f"✅ NLTK resource '{resource}' successfully downloaded.")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not download NLTK resources: {str(e)}")
+        print("Some features may not work properly.")
+
+def setup_environment():
+    """Set up any environment variables needed for the application."""
+    # Example: Setting transformer cache directory
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["TRANSFORMERS_CACHE"] = cache_dir
+    
+    # Example: Setting default matplotlib backend for Streamlit
+    os.environ["MPLBACKEND"] = "Agg"
+    
+    print("✅ Environment variables set.")
+
+def launch_streamlit():
+    """Launch the Streamlit application."""
+    app_file = Path(__file__).parent / "app.py"
+    
+    if not app_file.exists():
+        # Check if named differently
+        alternative_file = Path(__file__).parent / "streamlit-national-park-sentiment.py"
+        if alternative_file.exists():
+            app_file = alternative_file
+        else:
+            print("❌ Could not find the Streamlit application file.")
+            print("Make sure 'app.py' or 'streamlit-national-park-sentiment.py' exists in the same directory as this script.")
+            return False
+    
+    print(f"🚀 Launching Streamlit app: {app_file}")
+    
+    # Command to run Streamlit
+    cmd = [sys.executable, "-m", "streamlit", "run", str(app_file), "--browser.serverAddress", "localhost", "--server.port", "8501"]
+    
+    try:
+        # Open web browser after a short delay
+        def open_browser():
+            time.sleep(2)  # Give Streamlit a moment to start
+            webbrowser.open("http://localhost:8501")
+        
+        import threading
+        browser_thread = threading.Thread(target=open_browser)
+        browser_thread.daemon = True
+        browser_thread.start()
+        
+        # Start Streamlit process
+        process = subprocess.Popen(cmd)
+        
+        # Wait for the process to complete
+        process.wait()
+        return True
+    except Exception as e:
+        print(f"❌ Error launching Streamlit: {str(e)}")
+        return False
+
+def main():
+    """Main function to run the application setup and launch."""
+    print("=" * 80)
+    print("National Park Sentiment Analysis Dashboard - Setup")
+    print("=" * 80)
+    
+    # Check if all required packages are installed
+    if not check_dependencies():
+        return 1
+    
+    # Setup environment variables
+    setup_environment()
+    
+    # Download required NLTK resources
+    download_nltk_resources()
+    
+    print("\n" + "=" * 80)
+    print("Starting National Park Sentiment Analysis Dashboard...")
+    print("=" * 80 + "\n")
+    
+    # Launch Streamlit application
+    success = launch_streamlit()
+    
+    if not success:
+        print("\n❌ Failed to launch the application.")
+        return 1
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
