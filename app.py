@@ -1,235 +1,559 @@
-"""
-National Park Sentiment Analysis Deployment System
+import re
+import requests
+import matplotlib.pyplot as plt
+import numpy as np
+from bs4 import BeautifulSoup
+from transformers import pipeline
+import streamlit as st
+import torch
+import spacy
+from wordcloud import WordCloud
+import pandas as pd
+from collections import defaultdict
 
-Robust launch system with dependency management and environment configuration.
-"""
+# --- Streamlit Page Config (MUST BE FIRST) ---
+st.set_page_config(
+    page_title="National Park Review Analyzer",
+    page_icon="🏞️",
+    layout="wide"
+)
 
-import os
-import platform
-import subprocess
-import sys
-import time
-import webbrowser
-from pathlib import Path
-from typing import Dict, Tuple
+# --- NLP Setup ---
+@st.cache_resource
+def load_nlp_models():
+    # Try to load spacy model, download if not available
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except OSError:
+        import subprocess
+        subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
+        nlp = spacy.load("en_core_web_sm")
 
-# Package mapping with exact version specifications
-PACKAGE_REQUIREMENTS: Dict[str, str] = {
-    'streamlit': '1.29.0',
-    'pandas': '2.0.3',
-    'numpy': '1.24.3',
-    'matplotlib': '3.7.2',
-    'seaborn': '0.13.0',
-    'plotly': '5.18.0',
-    'wordcloud': '1.9.2',
-    'requests': '2.31.0',
-    'beautifulsoup4': '4.12.2',
-    'transformers': '4.35.2',
-    'torch': '2.1.0',
-    'scikit-learn': '1.3.2',
-    'nltk': '3.8.1',
-    'tqdm': '4.66.1',
-    'lxml': '4.9.3',
-    'protobuf': '3.20.3',
-    'sentencepiece': '0.1.99',
-    'tokenizers': '0.14.1'
+    sentiment_analyzer = pipeline(
+        "sentiment-analysis",
+        model="distilbert-base-uncased-finetuned-sst-2-english",
+        device=0 if torch.cuda.is_available() else -1
+    )
+    return nlp, sentiment_analyzer
+
+try:
+    nlp, sentiment_analyzer = load_nlp_models()
+except Exception as e:
+    st.error(f"Error loading NLP models: {str(e)}")
+    nlp, sentiment_analyzer = None, None
+
+# --- Constants ---
+ALLOWED_DOMAINS = ['recreation.gov', 'nps.gov', 'nationalparks.org']
+
+# Define categories for analysis
+CATEGORIES = {
+    'hiking': ['hiking', 'trail', 'hike', 'trek', 'trekking', 'paths', 'walk', 'walking'],
+    'fees': ['fee', 'price', 'cost', 'payment', 'dollar', 'money', 'expensive', 'cheap', 'affordable'],
+    'equipment': ['equipment', 'gear', 'supplies', 'tent', 'backpack', 'boots', 'poles', 'shoes'],
+    'water': ['water', 'lake', 'river', 'stream', 'pond', 'waterfall', 'creek', 'swimming'],
+    'facilities': ['facilities', 'restroom', 'bathroom', 'shower', 'toilet', 'visitor center', 'parking']
 }
 
-SYSTEM_CONFIG = {
-    "required_ports": [8501],
-    "min_python_version": (3, 8)
-}
+class RecreationGovScraper:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml',
+            'Accept-Language': 'en-US,en;q=0.9'
+        })
+        self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
 
-def check_system_compatibility() -> bool:
-    """Verify system meets minimum requirements."""
-    python_version = sys.version_info[:2]
-    if python_version < SYSTEM_CONFIG["min_python_version"]:
-        print(f"❌ Python {'.'.join(map(str, SYSTEM_CONFIG['min_python_version']))}+ required.")
-        return False
-    return True
+    def validate_url(self, url):
+        return any(domain in url for domain in ALLOWED_DOMAINS)
 
-def verify_dependencies() -> Tuple[bool, list]:
-    """Check installed packages against requirements."""
-    missing = []
-    wrong_version = []
-
-    for pkg, req_version in PACKAGE_REQUIREMENTS.items():
+    def extract_content(self, url):
         try:
-            imported = __import__(pkg)
-            installed_version = getattr(imported, '__version__', None)
-            
-            if installed_version != req_version:
-                wrong_version.append((pkg, installed_version, req_version))
-        except ImportError:
-            missing.append(pkg)
+            if not self.validate_url(url):
+                return {'error': 'Domain not allowed. Please use a URL from recreation.gov, nps.gov, or nationalparks.org'}
 
-    return (len(missing) == 0 and len(wrong_version) == 0), missing, wrong_version
+            response = self.session.get(url, timeout=15)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
 
-def setup_virtual_environment():
-    """Create and configure a virtual environment."""
-    venv_path = Path(__file__).parent / "sentiment_env"
-    
-    if platform.system() == "Windows":
-        venv_script = str(venv_path / "Scripts" / "activate")
+            # Extract reviews specifically for Recreation.gov
+            reviews = []
+            review_elements = soup.select('.rec-reviews-card')
+
+            if not review_elements and 'recreation.gov' in url:
+                # Try alternative selectors for Recreation.gov
+                review_elements = soup.select('.review-content') or soup.select('[data-component="review"]')
+
+            for review_elem in review_elements:
+                review_text = review_elem.get_text(strip=True)
+                if review_text:
+                    reviews.append(review_text)
+
+            # If no reviews found through specific selectors, fallback to paragraphs
+            if not reviews:
+                all_text = ' '.join(p.get_text(strip=True) for p in soup.find_all('p') if len(p.get_text(strip=True)) > 20)
+                reviews = [all_text]
+
+            return {
+                'reviews': reviews,
+                'fees': self._extract_fees(soup),
+                'facilities': self._extract_facilities(soup),
+                'activities': self._extract_activities(soup),
+                'title': self._extract_title(soup)
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _extract_title(self, soup):
+        title = soup.find('h1')
+        if title:
+            return title.get_text(strip=True)
+        return "Unknown Park"
+
+    def _extract_fees(self, soup):
+        fees = []
+        fee_patterns = [
+            r'\$\d+\.?\d*(?:\s*-\s*\$\d+\.?\d*)?(?:\s*per\s*(?:person|vehicle|night|day|site|entrance))?',
+            r'(?:Fee|Price|Cost):\s*\$\d+\.?\d*'
+        ]
+
+        for pattern in fee_patterns:
+            fees.extend(re.findall(pattern, soup.text))
+
+        return fees[:5]  # Return up to 5 fee matches
+
+    def _extract_facilities(self, soup):
+        facilities = []
+        facility_keywords = ['restroom', 'shower', 'campsite', 'picnic', 'visitor center',
+                            'parking', 'trailhead', 'lodging', 'camping', 'cabin']
+
+        for keyword in facility_keywords:
+            if keyword.lower() in soup.text.lower():
+                facilities.append(keyword)
+
+        # Also look for lists that might contain facilities
+        for list_item in soup.find_all('li'):
+            item_text = list_item.get_text(strip=True).lower()
+            if any(keyword in item_text for keyword in facility_keywords):
+                facilities.append(item_text[:50] + "..." if len(item_text) > 50 else item_text)
+
+        return list(set(facilities))[:5]  # Deduplicate and limit to 5
+
+    def _extract_activities(self, soup):
+        activities = []
+        activity_keywords = ['hiking', 'swimming', 'fishing', 'boating', 'camping',
+                            'wildlife viewing', 'biking', 'kayaking', 'canoeing', 'photography']
+
+        for keyword in activity_keywords:
+            if keyword.lower() in soup.text.lower():
+                activities.append(keyword)
+
+        return list(set(activities))  # Deduplicate
+
+def map_sentiment_label(sentiment):
+    """Maps sentiment labels to standardized format"""
+    if sentiment == 'POSITIVE':
+        return 'positive'
+    elif sentiment == 'NEGATIVE':
+        return 'negative'
     else:
-        venv_script = f"source {venv_path}/bin/activate"
+        return 'neutral'
 
-    if not venv_path.exists():
-        print("🔧 Creating virtual environment...")
-        subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
-    
-    print("🔧 Installing dependencies...")
-    install_cmd = [
-        sys.executable, "-m", "pip", "install",
-        "--disable-pip-version-check",
-        "--no-cache-dir",
-        "-r", "requirements.txt"
-    ]
-    subprocess.run(install_cmd, check=True)
-    print(f"✅ Virtual environment ready at: {venv_path}")
+def categorize_text(text):
+    """Identify which categories the text belongs to"""
+    text_lower = text.lower()
+    categories_found = []
 
-def configure_environment():
-    """Set up runtime environment and paths."""
-    # Create project-specific cache directories
-    cache_paths = {
-        "TRANSFORMERS_CACHE": "cache/transformers",
-        "NLTK_DATA": "cache/nltk",
-        "TORCH_HOME": "cache/torch"
-    }
+    for category, keywords in CATEGORIES.items():
+        if any(keyword in text_lower for keyword in keywords):
+            categories_found.append(category)
 
-    for env_var, path in cache_paths.items():
-        full_path = Path(__file__).parent / path
-        full_path.mkdir(parents=True, exist_ok=True)
-        os.environ[env_var] = str(full_path)
-        print(f"📁 Configured {env_var} => {full_path}")
+    # If no categories found, mark as 'general'
+    if not categories_found:
+        categories_found.append('general')
 
-    # Configure essential environment variables
-    os.environ["MPLBACKEND"] = "Agg"
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    return categories_found
 
-def initialize_nltk():
-    """Ensure NLTK resources are available."""
-    resources = {
-        'stopwords': 'corpora/stopwords',
-        'punkt': 'tokenizers/punkt',
-        'vader_lexicon': 'sentiment/vader_lexicon'
-    }
+def analyze_content(url):
+    scraper = RecreationGovScraper()
+    data = scraper.extract_content(url)
 
-    try:
-        import nltk
-        for resource, path in resources.items():
+    if 'error' in data:
+        return None, f"Error: {data['error']}"
+
+    if not data['reviews']:
+        return None, "Error: No review content found on the page."
+
+    # Prepare for analysis
+    all_sentiments = []
+    category_sentiments = defaultdict(list)
+    sentences = []
+
+    # Process each review
+    for review in data['reviews']:
+        # Split review into sentences for more granular analysis
+        review_sentences = re.split(r'(?<=[.!?])\s+', review)
+
+        for sentence in review_sentences:
+            if len(sentence.strip()) < 10:  # Skip very short sentences
+                continue
+
+            sentences.append(sentence)
+
+            # Determine categories this sentence belongs to
+            sentence_categories = categorize_text(sentence)
+
+            # Break long sentences into chunks for the sentiment analyzer
+            text_chunks = [sentence[i:i+512] for i in range(0, len(sentence), 512)]
+
             try:
-                nltk.data.find(path)
-                print(f"✅ NLTK {resource} already available")
-            except LookupError:
-                print(f"📥 Downloading {resource}...")
-                nltk.download(resource, quiet=True)
-                nltk.data.find(path)  # Verify download
-                print(f"✅ {resource} successfully installed")
-    except Exception as e:
-        print(f"❌ NLTK initialization failed: {str(e)}")
-        sys.exit(1)
+                for chunk in text_chunks:
+                    sentiment_result = sentiment_analyzer(chunk)[0]
+                    sentiment_label = sentiment_result['label']
+                    confidence = sentiment_result['score']
 
-def launch_dashboard():
-    """Start the Streamlit application with monitoring."""
-    app_files = [
-        "app.py",
-        "dashboard.py",
-        "national_park_sentiment.py"
-    ]
+                    # Add neutrality for mid-range confidence scores
+                    if 0.55 <= confidence <= 0.70:
+                        sentiment_label = 'NEUTRAL'
+                        confidence = 0.5 + (confidence - 0.55) * 0.5
 
-    for app_file in app_files:
-        if (Path(__file__).parent / app_file).exists():
-            target_app = app_file
-            break
+                    # Store the sentiment
+                    standardized_label = map_sentiment_label(sentiment_label)
+                    sentiment_entry = {
+                        'text': chunk,
+                        'sentiment': standardized_label,
+                        'confidence': confidence,
+                        'categories': sentence_categories
+                    }
+
+                    all_sentiments.append(sentiment_entry)
+
+                    # Categorize by topics
+                    for category in sentence_categories:
+                        category_sentiments[category].append(sentiment_entry)
+
+            except Exception as e:
+                return None, f"Sentiment analysis failed: {str(e)}"
+
+    if not all_sentiments:
+        return None, "Error: Could not perform sentiment analysis."
+
+    # Create overall sentiment distribution
+    sentiment_df = pd.DataFrame([{'sentiment': s['sentiment']} for s in all_sentiments])
+    sentiment_counts = sentiment_df['sentiment'].value_counts()
+
+    # Add missing sentiment categories if any are absent
+    for sentiment in ['positive', 'negative', 'neutral']:
+        if sentiment not in sentiment_counts:
+            sentiment_counts[sentiment] = 0
+
+    # Create category sentiment distribution
+    category_data = []
+    for category, sentiments in category_sentiments.items():
+        # Count sentiment by category
+        cat_sentiment_counts = defaultdict(int)
+        for s in sentiments:
+            cat_sentiment_counts[s['sentiment']] += 1
+
+        # Ensure all sentiments are represented
+        for sentiment in ['positive', 'negative', 'neutral']:
+            if sentiment not in cat_sentiment_counts:
+                cat_sentiment_counts[sentiment] = 0
+
+        # Add to dataset for plotting
+        for sentiment, count in cat_sentiment_counts.items():
+            category_data.append({
+                'category': category,
+                'sentiment': sentiment,
+                'count': count
+            })
+
+    category_df = pd.DataFrame(category_data)
+
+    # Create visualizations
+    # 1. Overall Sentiment Distribution
+    plt.figure(figsize=(10, 6))
+    colors = {'positive': 'green', 'neutral': 'gold', 'negative': 'red'}
+    overall_sentiment_fig = plt.figure(figsize=(10, 6))
+    ax = overall_sentiment_fig.add_subplot(111)
+    bars = ax.bar(sentiment_counts.index, sentiment_counts.values, color=[colors[s] for s in sentiment_counts.index])
+    ax.set_title('Overall Sentiment Distribution', fontsize=16)
+    ax.set_ylabel('Number of Reviews', fontsize=12)
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+    # Add counts as text on bars
+    for bar in bars:
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                f'{int(height)}', ha='center', va='bottom')
+
+    plt.tight_layout()
+
+    # 2. Sentiment Distribution by Category
+    if category_sentiments:
+        # Pivot the data for easier plotting
+        pivot_df = category_df.pivot_table(index='category', columns='sentiment', values='count', fill_value=0)
+
+        cat_fig = plt.figure(figsize=(12, 7))
+        ax = cat_fig.add_subplot(111)
+
+        # Set width of bars
+        bar_width = 0.25
+        index = np.arange(len(pivot_df.index))
+
+        # Plot bars for each sentiment
+        for i, sentiment in enumerate(['positive', 'neutral', 'negative']):
+            if sentiment in pivot_df.columns:
+                bars = ax.bar(index + i*bar_width, pivot_df[sentiment], bar_width,
+                         label=sentiment, color=colors[sentiment])
+
+                # Add count labels on bars
+                for bar in bars:
+                    height = bar.get_height()
+                    if height > 0:
+                        ax.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                                f'{int(height)}', ha='center', va='bottom', fontsize=9)
+
+        # Set plot attributes
+        ax.set_title('Sentiment Distribution by Category', fontsize=16)
+        ax.set_ylabel('Number of Mentions', fontsize=12)
+        ax.set_xticks(index + bar_width)
+        ax.set_xticklabels(pivot_df.index, rotation=30, ha='right')
+        ax.legend(title='Sentiment')
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+        plt.tight_layout()
     else:
-        print("❌ No application file found. Tried:")
-        print("\n".join(f"- {f}" for f in app_files))
-        sys.exit(1)
+        cat_fig = None
 
-    print(f"🚀 Launching {target_app}...")
-    
-    # Configure Streamlit command
-    cmd = [
-        sys.executable, "-m", "streamlit", "run",
-        str(Path(__file__).parent / target_app),
-        "--server.port", "8501",
-        "--server.headless", "true",
-        "--browser.serverAddress", "0.0.0.0",
-        "--logger.level", "info"
-    ]
+    # 3. Sentiment Confidence Distribution
+    conf_fig = plt.figure(figsize=(10, 6))
+    ax = conf_fig.add_subplot(111)
 
-    # Start browser after delay
-    def browser_launcher():
-        time.sleep(5)
-        webbrowser.open("http://localhost:8501")
-    
-    import threading
-    threading.Thread(target=browser_launcher, daemon=True).start()
+    # Get confidence values for each sentiment
+    pos_conf = [s['confidence'] for s in all_sentiments if s['sentiment'] == 'positive']
+    neu_conf = [s['confidence'] for s in all_sentiments if s['sentiment'] == 'neutral']
+    neg_conf = [s['confidence'] for s in all_sentiments if s['sentiment'] == 'negative']
 
-    # Run Streamlit with output capture
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
+    # Create histogram
+    if pos_conf:
+        ax.hist(pos_conf, bins=10, alpha=0.7, label='Positive', color='green')
+    if neu_conf:
+        ax.hist(neu_conf, bins=10, alpha=0.7, label='Neutral', color='gold')
+    if neg_conf:
+        ax.hist(neg_conf, bins=10, alpha=0.7, label='Negative', color='red')
 
-        # Real-time output monitoring
-        while True:
-            line = process.stdout.readline()
-            if not line and process.poll() is not None:
-                break
-            print(line.strip())
+    ax.set_title('Sentiment Confidence Distribution', fontsize=16)
+    ax.set_xlabel('Confidence Score', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.legend()
+    ax.grid(alpha=0.3)
 
-        if process.returncode != 0:
-            print(f"❌ Application exited with code {process.returncode}")
-            sys.exit(1)
+    plt.tight_layout()
 
-    except KeyboardInterrupt:
-        print("\n🛑 Received shutdown signal...")
-        process.terminate()
-        sys.exit(0)
+    # 4. Word Cloud
+    combined_text = ' '.join(data['reviews'])
+    if combined_text:
+        try:
+            wordcloud = WordCloud(width=800, height=400, background_color='white',
+                                 colormap='viridis', max_words=100,
+                                 contour_width=1).generate(combined_text)
+            wordcloud_fig = plt.figure(figsize=(10, 5))
+            ax = wordcloud_fig.add_subplot(111)
+            ax.imshow(wordcloud, interpolation='bilinear')
+            ax.set_title('Most Common Words in Reviews', fontsize=16)
+            ax.axis('off')
+            plt.tight_layout()
+        except Exception as e:
+            wordcloud_fig = None
+    else:
+        wordcloud_fig = None
 
-def main():
-    """Main deployment workflow."""
-    print("\n" + "=" * 60)
-    print("National Park Sentiment Analysis Deployment System")
-    print("=" * 60 + "\n")
+    # 5. Top Positive and Negative Sentences
+    # Sort by confidence
+    positive_sentences = sorted(
+        [s for s in all_sentiments if s['sentiment'] == 'positive'],
+        key=lambda x: x['confidence'],
+        reverse=True
+    )
 
-    if not check_system_compatibility():
-        sys.exit(1)
+    negative_sentences = sorted(
+        [s for s in all_sentiments if s['sentiment'] == 'negative'],
+        key=lambda x: x['confidence'],
+        reverse=True
+    )
 
-    print("🔍 Checking system environment...")
-    deps_ok, missing, wrong_versions = verify_dependencies()
-    
-    if not deps_ok:
-        if missing:
-            print("\n❌ Missing dependencies:")
-            print("\n".join(f"- {pkg}" for pkg in missing))
-        if wrong_versions:
-            print("\n⚠️ Version mismatches:")
-            for pkg, actual, required in wrong_versions:
-                print(f"- {pkg}: Installed {actual or 'unknown'}, Required {required}")
-        
-        print("\n🔄 Attempting automatic repair...")
-        setup_virtual_environment()
-    
-    configure_environment()
-    initialize_nltk()
-    
-    print("\n" + "=" * 60)
-    print("Starting Sentiment Analysis Dashboard")
-    print("=" * 60 + "\n")
-    
-    try:
-        launch_dashboard()
-    except Exception as e:
-        print(f"❌ Critical failure: {str(e)}")
-        sys.exit(1)
+    # Prepare report data
+    positive_count = sum(1 for s in all_sentiments if s['sentiment'] == 'positive')
+    negative_count = sum(1 for s in all_sentiments if s['sentiment'] == 'negative')
+    neutral_count = sum(1 for s in all_sentiments if s['sentiment'] == 'neutral')
+    total_count = len(all_sentiments)
 
-if __name__ == "__main__":
-    main()
+    # Calculate percentages
+    if total_count > 0:
+        positive_pct = (positive_count / total_count) * 100
+        negative_pct = (negative_count / total_count) * 100
+        neutral_pct = (neutral_count / total_count) * 100
+    else:
+        positive_pct = negative_pct = neutral_pct = 0
+
+    report = {
+        'title': data['title'],
+        'url': url,
+        'positive_count': positive_count,
+        'negative_count': negative_count,
+        'neutral_count': neutral_count,
+        'total_count': total_count,
+        'positive_pct': positive_pct,
+        'negative_pct': negative_pct,
+        'neutral_pct': neutral_pct,
+        'fees': data['fees'],
+        'facilities': data['facilities'],
+        'activities': data['activities'],
+        'overall_sentiment_fig': overall_sentiment_fig,
+        'category_sentiment_fig': cat_fig,
+        'confidence_fig': conf_fig,
+        'wordcloud': wordcloud_fig,
+        'top_positive': positive_sentences[:5] if positive_sentences else [],
+        'top_negative': negative_sentences[:5] if negative_sentences else [],
+        'category_sentiments': category_sentiments
+    }
+
+    return report, None
+
+# Streamlit Interface
+st.title("🏞️ National Park Review Analyzer")
+st.write("""
+This tool analyzes reviews and information from national park websites.
+Enter a URL from Recreation.gov, NPS.gov, or NationalParks.org to get started.
+""")
+
+url_input = st.text_input(
+    "Enter National Park URL",
+    placeholder="https://www.recreation.gov/gateways/2584"
+)
+
+if st.button("Analyze", type="primary"):
+    if not url_input:
+        st.error("Please enter a URL to analyze")
+    else:
+        with st.spinner("Analyzing... This may take a minute"):
+            report, error = analyze_content(url_input)
+
+            if error:
+                st.error(error)
+            elif report:
+                # Display report
+                st.header(f"Analysis Report: {report['title']}")
+
+                # Overall metrics
+                st.subheader("Overall Sentiment")
+                cols = st.columns(3)
+
+                with cols[0]:
+                    st.metric("Positive", f"{report['positive_count']} ({report['positive_pct']:.1f}%)")
+
+                with cols[1]:
+                    st.metric("Neutral", f"{report['neutral_count']} ({report['neutral_pct']:.1f}%)")
+
+                with cols[2]:
+                    st.metric("Negative", f"{report['negative_count']} ({report['negative_pct']:.1f}%)")
+
+                # Display overall sentiment distribution
+                st.pyplot(report['overall_sentiment_fig'])
+
+                # Display category sentiment distribution if available
+                if report['category_sentiment_fig']:
+                    st.subheader("Sentiment by Category")
+                    st.pyplot(report['category_sentiment_fig'])
+
+                    # Show detailed category breakdown
+                    st.subheader("Category Details")
+
+                    for category in CATEGORIES.keys():
+                        if category in report['category_sentiments']:
+                            with st.expander(f"{category.title()} - {len(report['category_sentiments'][category])} mentions"):
+                                cat_sentiments = report['category_sentiments'][category]
+                                pos = sum(1 for s in cat_sentiments if s['sentiment'] == 'positive')
+                                neg = sum(1 for s in cat_sentiments if s['sentiment'] == 'negative')
+                                neu = sum(1 for s in cat_sentiments if s['sentiment'] == 'neutral')
+
+                                st.write(f"👍 Positive: {pos} ({pos/len(cat_sentiments)*100:.1f}%)")
+                                st.write(f"👎 Negative: {neg} ({neg/len(cat_sentiments)*100:.1f}%)")
+                                st.write(f"😐 Neutral: {neu} ({neu/len(cat_sentiments)*100:.1f}%)")
+
+                                # Show top sentence for this category
+                                if cat_sentiments:
+                                    top_positive = next((s for s in cat_sentiments if s['sentiment'] == 'positive'), None)
+                                    top_negative = next((s for s in cat_sentiments if s['sentiment'] == 'negative'), None)
+
+                                    if top_positive:
+                                        st.write("**Sample positive mention:**")
+                                        st.write(f"*\"{top_positive['text']}\"*")
+
+                                    if top_negative:
+                                        st.write("**Sample negative mention:**")
+                                        st.write(f"*\"{top_negative['text']}\"*")
+                        else:
+                            with st.expander(f"{category.title()} - 0 mentions"):
+                                st.write("No mentions found for this category.")
+
+                # Display confidence distribution
+                st.subheader("Sentiment Confidence")
+                st.pyplot(report['confidence_fig'])
+
+                # Display word cloud
+                if report['wordcloud']:
+                    st.subheader("Word Cloud")
+                    st.pyplot(report['wordcloud'])
+
+                # Display top positive and negative sentences
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.subheader("Top Positive Mentions")
+                    if report['top_positive']:
+                        for i, sentence in enumerate(report['top_positive'], 1):
+                            st.write(f"**{i}.** *\"{sentence['text']}\"* (Confidence: {sentence['confidence']:.2f})")
+                    else:
+                        st.write("No positive mentions found.")
+
+                with col2:
+                    st.subheader("Top Negative Mentions")
+                    if report['top_negative']:
+                        for i, sentence in enumerate(report['top_negative'], 1):
+                            st.write(f"**{i}.** *\"{sentence['text']}\"* (Confidence: {sentence['confidence']:.2f})")
+                    else:
+                        st.write("No negative mentions found.")
+
+                # Display extracted information
+                st.subheader("Park Information")
+
+                if report['fees']:
+                    with st.expander("Fees Mentioned"):
+                        for fee in report['fees']:
+                            st.write(f"- {fee}")
+
+                if report['facilities']:
+                    with st.expander("Facilities"):
+                        for facility in report['facilities']:
+                            st.write(f"- {facility}")
+
+                if report['activities']:
+                    with st.expander("Activities"):
+                        for activity in report['activities']:
+                            st.write(f"- {activity}")
+
+st.sidebar.header("About")
+st.sidebar.write("""
+This tool uses natural language processing to analyze reviews and content from national park websites.
+It extracts information about fees, facilities, and visitor sentiments.
+""")
+
+st.sidebar.subheader("Categories Analyzed")
+for category in CATEGORIES:
+    st.sidebar.write(f"- {category.title()}")
+
+st.sidebar.subheader("Supported Websites")
+for domain in ALLOWED_DOMAINS:
+    st.sidebar.write(f"- {domain}")
