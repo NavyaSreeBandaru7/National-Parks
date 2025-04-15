@@ -1,8 +1,7 @@
 """
 Launch script for National Park Sentiment Analysis Dashboard
 
-This script provides a convenient way to start the Streamlit application
-and handles any necessary setup before launch.
+Updated to match actual dependencies from the analysis code
 """
 
 import os
@@ -12,23 +11,19 @@ import time
 import webbrowser
 from pathlib import Path
 
-# Mapping of import names to package names
+# Mapping of import names to package names (updated to match actual dependencies)
 PACKAGE_MAP = {
     'bs4': 'beautifulsoup4',
-    'sklearn': 'scikit-learn',
+    'spacy': 'spacy',
     'torch': 'torch',
-    'nltk': 'nltk',
     'transformers': 'transformers',
-    'tqdm': 'tqdm',
-    'plotly': 'plotly',
     'matplotlib': 'matplotlib',
-    'seaborn': 'seaborn',
     'pandas': 'pandas',
     'numpy': 'numpy',
     'streamlit': 'streamlit',
     'wordcloud': 'wordcloud',
     'requests': 'requests',
-    'lxml': 'lxml'
+    'tqdm': 'tqdm'
 }
 
 def check_dependencies():
@@ -50,29 +45,22 @@ def check_dependencies():
     print(f"pip install {' '.join(missing)}")
     return False
 
-def download_nltk_resources():
-    """Download required NLTK resources if not already present."""
+def download_spacy_model():
+    """Download required spaCy model if not present"""
     try:
-        import nltk
-        resources = {
-            'stopwords': 'corpora/stopwords',
-            'punkt': 'tokenizers/punkt'
-        }
-        
-        for resource, path in resources.items():
-            try:
-                nltk.data.find(path)
-                print(f"✅ NLTK resource '{resource}' is already downloaded.")
-            except LookupError:
-                print(f"📥 Downloading NLTK resource: {resource}")
-                nltk.download(resource, quiet=True)
-                # Verify download
-                nltk.data.find(path)
-                print(f"✅ Successfully downloaded '{resource}'")
-                
+        import spacy
+        print("🔍 Checking for spaCy model...")
+        try:
+            spacy.load("en_core_web_sm")
+            print("✅ spaCy model 'en_core_web_sm' already installed")
+        except OSError:
+            print("📥 Downloading spaCy model: en_core_web_sm")
+            subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], check=True)
+            print("✅ Successfully downloaded spaCy model")
+            
     except Exception as e:
-        print(f"⚠️ Error downloading NLTK resources: {str(e)}")
-        print("Some features may not work properly.")
+        print(f"⚠️ Error with spaCy model: {str(e)}")
+        print("Some NLP features may not work properly.")
 
 def setup_environment():
     """Set up environment variables and directories."""
@@ -84,30 +72,14 @@ def setup_environment():
     # Configure matplotlib backend
     os.environ["MPLBACKEND"] = "Agg"
     
-    # Set NLTK data path
-    nltk_data = os.path.join(os.path.expanduser("~"), "nltk_data")
-    os.makedirs(nltk_data, exist_ok=True)
-    os.environ["NLTK_DATA"] = nltk_data
-    
-    print("✅ Environment configured with cache and data directories.")
+    print("✅ Environment configured with cache directories.")
 
 def launch_streamlit():
     """Launch the Streamlit application."""
-    app_files = [
-        Path(__file__).parent / "app.py",
-        Path(__file__).parent / "streamlit-national-park-sentiment.py"
-    ]
+    app_path = Path(__file__).parent / "app.py"
     
-    app_path = None
-    for path in app_files:
-        if path.exists():
-            app_path = path
-            break
-    
-    if not app_path:
-        print("❌ Could not find Streamlit application file.")
-        print("Please ensure one of these files exists:")
-        print("\n".join(f"- {p.name}" for p in app_files))
+    if not app_path.exists():
+        print("❌ Could not find Streamlit application file (app.py)")
         return False
 
     print(f"🚀 Launching Streamlit app: {app_path.name}")
@@ -163,7 +135,7 @@ def main():
     if not check_dependencies():
         return 1
     
-    download_nltk_resources()
+    download_spacy_model()
     setup_environment()
     
     print("\n" + "=" * 80)
